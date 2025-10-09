@@ -1,5 +1,5 @@
 from typing import List, Optional
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 class Vulnerability(BaseModel):
     id: str
@@ -14,5 +14,8 @@ class Vulnerability(BaseModel):
 
 class RemediationSuggestion(BaseModel):
     id: str
-    proposed_commands: List[str]
-    notes: str
+    proposed_commands: List[str] = Field(description="List of specific remediation commands for this vulnerability")
+    notes: str = Field(description="Additional context or warnings about the remediation")
+
+class BatchResult(BaseModel):
+    suggestions: List[RemediationSuggestion] = Field(description="List of remediation suggestions for the vulnerabilities")

@@ -5,13 +5,12 @@ from typing import Iterable, List, Optional
 from pathlib import Path
 
 from pydantic import BaseModel, ValidationError
-from pydantic_ai import Agent
+from pydantic_ai import Agent, NativeOutput
 from pydantic_ai.models.openai import OpenAIChatModel
 from pydantic_ai.providers.openai import OpenAIProvider
 from dotenv import load_dotenv
-import requests
 
-from schemas import Vulnerability, RemediationSuggestion
+from schemas import Vulnerability, RemediationSuggestion, BatchResult
 
 
 SEVERITY_ORDER = {
@@ -23,8 +22,6 @@ SEVERITY_ORDER = {
 }
 
 
-class BatchResult(BaseModel):
-    suggestions: List[RemediationSuggestion]
 
 
 def load_vulnerabilities(path: Path) -> List[Vulnerability]:
@@ -74,16 +71,19 @@ def build_agent(model_name: str, base_url: str, api_key: Optional[str]) -> Agent
         model_name=model_name,
         provider=OpenAIProvider(base_url=base_url, api_key=api_key),
     )
-    # No output_type, accept free-form text
+    # Use structured output with strict validation
     agent = Agent(
         openrouter_model,
+        output_type=NativeOutput(BatchResult, strict=True),
         system_prompt=(
             "You are a systems hardening assistant. For each batch of Nessus findings, propose concise remediation commands.\n"
             "- Prefer safe, idempotent commands.\n"
-            "- If you know the platform (Linux/Windows), use appropriate tools.\n"
-            "- It's OK to reply in plain text or JSON.\n"
-            "- Keep it brief."
-            "- Keep the remedations specific to each vulnerability, such as only updating a specific package instead of updating all packages at once."
+            "- You are a Linux systems hardening assistant, so use Linux-specific commands.\n"
+            "- Keep remediations specific to each vulnerability (e.g., update specific package, not all packages).\n"
+            "- Prefer not to sudo apt update all packages at once, prefer to update specific packages.\n"
+            "- Provide clear, actionable commands that can be executed directly.\n"
+            "- Include relevant notes about potential risks or considerations.\n"
+            "- Return structured output with suggestions array containing id, proposed_commands, and notes for each vulnerability."
         ),
     )
     return agent
@@ -91,7 +91,7 @@ def build_agent(model_name: str, base_url: str, api_key: Optional[str]) -> Agent
 
 def render_batch_prompt(vulns: List[Vulnerability]) -> str:
     lines: List[str] = []
-    lines.append("Propose remediation commands for these Nessus findings. Keep it brief. If you include JSON, use a 'suggestions' array.")
+    lines.append("Propose remediation commands for these Nessus findings. Return structured output with a suggestions array.")
     for v in vulns:
         lines.append("---")
         lines.append(f"id: {v.id}")
@@ -111,84 +111,6 @@ def render_batch_prompt(vulns: List[Vulnerability]) -> str:
     return "\n".join(lines)
 
 
-def call_openai_compatible_json(base_url: str, model_name: str, system: str, user: str, api_key: Optional[str] = None) -> str:
-    url = base_url.rstrip("/") + "/chat/completions"
-    payload = {
-        "model": model_name,
-        "temperature": 0.1,
-        "messages": [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ],
-    }
-    headers = {"Content-Type": "application/json"}
-    if api_key:
-        headers["Authorization"] = f"Bearer {api_key}"
-    # Optional OpenRouter headers (improves routing/analytics if provided)
-    site_url = os.getenv("OPENROUTER_SITE_URL")
-    app_name = os.getenv("OPENROUTER_APP_NAME")
-    if site_url:
-        headers["HTTP-Referer"] = site_url
-    if app_name:
-        headers["X-Title"] = app_name
-    resp = requests.post(url, headers=headers, data=json.dumps(payload), timeout=120)
-    resp.raise_for_status()
-    data = resp.json()
-    content = data["choices"][0]["message"]["content"]
-    return content
-
-
-def extract_first_json_object(text: str) -> Optional[dict]:
-    start = text.find("{")
-    if start == -1:
-        return None
-    depth = 0
-    for i in range(start, len(text)):
-        ch = text[i]
-        if ch == "{":
-            depth += 1
-        elif ch == "}":
-            depth -= 1
-            if depth == 0:
-                try:
-                    return json.loads(text[start : i + 1])
-                except Exception:
-                    return None
-    return None
-
-
-def extract_commands_from_text(text: str) -> List[str]:
-    lines = text.splitlines()
-    commands: List[str] = []
-    in_code = False
-    for raw in lines:
-        s = raw.strip()
-        if s.startswith("```"):
-            in_code = not in_code
-            continue
-        if not s:
-            continue
-        if in_code:
-            commands.append(s)
-            continue
-        for prefix in ("- ", "* ", "• ", "1. ", "2. ", "3. "):
-            if s.startswith(prefix):
-                s = s[len(prefix):].strip()
-                break
-        starters = (
-            "sudo ", "apt ", "apt-get ", "dnf ", "yum ", "zypper ", "systemctl ",
-            "service ", "choco ", "winget ", "powershell ", "pwsh ", "netsh ",
-            "reg ", "sc ", "Set-", "Get-", "New-", "Remove-", "Install-", "Update-",
-        )
-        if s.startswith(starters) or ";" in s or "&&" in s:
-            commands.append(s)
-    seen = set()
-    deduped: List[str] = []
-    for c in commands:
-        if c not in seen:
-            seen.add(c)
-            deduped.append(c)
-    return deduped
 
 
 def main():
@@ -208,7 +130,6 @@ def main():
         min_severity = int(min_sev_env)
     except Exception:
         min_severity = 4
-    lenient = True
 
     # Optional cap on number of vulnerabilities to process
     try:
@@ -240,40 +161,15 @@ def main():
 
     print(f"Processing {total} vulnerabilities in batches of {batch_size} using {model_name} @ {base_url}...")
 
-    system_prompt_for_direct = getattr(agent, "_system_prompt", "")
-
     for chunk in batched(prioritized, batch_size):
         prompt = render_batch_prompt(chunk)
         try:
             result = agent.run_sync(prompt)
-            if lenient:
-                text = str(result.output)
-                obj = extract_first_json_object(text)
-                if obj and isinstance(obj, dict) and "suggestions" in obj:
-                    try:
-                        batch_model = BatchResult.model_validate(obj)
-                        all_suggestions.extend(batch_model.suggestions)
-                    except Exception:
-                        # JSON didn't match; fallback to heuristic
-                        cmds = extract_commands_from_text(text)
-                        if not cmds:
-                            cmds = [text[:500]]
-                        for v in chunk:
-                            all_suggestions.append(
-                                RemediationSuggestion(id=v.id, proposed_commands=cmds, notes="Lenient heuristic extraction from free-form output.")
-                            )
-                else:
-                    cmds = extract_commands_from_text(text)
-                    if not cmds:
-                        cmds = [text[:500]]
-                    for v in chunk:
-                        all_suggestions.append(
-                            RemediationSuggestion(id=v.id, proposed_commands=cmds, notes="Lenient heuristic extraction from free-form output.")
-                        )
-            else:
-                batch_out = result.output
-                all_suggestions.extend(batch_out.suggestions)
+            # With structured output, result.output is already a BatchResult instance
+            batch_result: BatchResult = result.output
+            all_suggestions.extend(batch_result.suggestions)
             processed += len(chunk)
+            
             if hasattr(result, "usage"):
                 try:
                     usage = result.usage()
@@ -284,44 +180,20 @@ def main():
                     print(f"Processed {processed}/{total}")
             else:
                 print(f"Processed {processed}/{total}")
+                
         except Exception as e:
             print(f"Error running agent on batch starting with id {chunk[0].id}: {e}")
-            # Single simple fallback: direct call and lenient parse
-            try:
-                raw_text = call_openai_compatible_json(
-                    base_url=base_url,
-                    model_name=model_name,
-                    system=system_prompt_for_direct or "",
-                    user=prompt,
-                    api_key=api_key,
+            # Fallback: create basic suggestions for failed batch
+            for v in chunk:
+                all_suggestions.append(
+                    RemediationSuggestion(
+                        id=v.id, 
+                        proposed_commands=[f"# Manual review required for {v.title}"], 
+                        notes=f"Failed to generate remediation: {str(e)}"
+                    )
                 )
-                obj = extract_first_json_object(raw_text)
-                if obj and isinstance(obj, dict) and "suggestions" in obj:
-                    try:
-                        batch_model = BatchResult.model_validate(obj)
-                        all_suggestions.extend(batch_model.suggestions)
-                    except Exception:
-                        cmds = extract_commands_from_text(raw_text)
-                        if not cmds:
-                            cmds = [raw_text[:500]]
-                        for v in chunk:
-                            all_suggestions.append(
-                                RemediationSuggestion(id=v.id, proposed_commands=cmds, notes="Lenient extraction from direct call.")
-                            )
-                else:
-                    cmds = extract_commands_from_text(raw_text)
-                    if not cmds:
-                        cmds = [raw_text[:500]]
-                    for v in chunk:
-                        all_suggestions.append(
-                            RemediationSuggestion(id=v.id, proposed_commands=cmds, notes="Lenient extraction from direct call.")
-                        )
-                processed += len(chunk)
-                print(f"Recovered via simple direct call. Progress: {processed}/{total}")
-                continue
-            except Exception as e4:
-                print(f"Direct call failed: {e4}")
-                print("Continuing with next batch...")
+            processed += len(chunk)
+            print(f"Added fallback suggestions for failed batch. Progress: {processed}/{total}")
             continue
 
     # De-duplicate by id, keep last
