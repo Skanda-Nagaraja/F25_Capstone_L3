@@ -44,31 +44,43 @@ class AnsibleExecutor:
         cmd = [
             "ansible-playbook",
             "-i", self.inventory_path,
-            playbook_path
+            playbook_path,
+            "-vvv"
         ]
         
         if check_mode:
             cmd.append("--check")
         
         console.print(f"[cyan]Executing playbook: {playbook_path}[/cyan]")
+        console.print(f"[dim]CMD: {' '.join(cmd)}[/dim]")
         if check_mode:
             console.print("[yellow](Check mode - no changes will be made)[/yellow]")
         
         try:
+            # Use debug callback to show full task results including stdout/stderr
+            env = {**os.environ, "ANSIBLE_STDOUT_CALLBACK": "debug", "ANSIBLE_FORCE_COLOR": "false"}
             result = subprocess.run(
                 cmd,
                 capture_output=True,
                 text=True,
-                timeout=600  # 10 minute timeout
+                timeout=600,  # 10 minute timeout
+                env=env
             )
             
             if result.returncode == 0:
                 console.print("[green]✓ Playbook executed successfully[/green]")
-                return True, result.stdout
+                # Show stdout so user can see VM output
+                if result.stdout:
+                    console.print(result.stdout, markup=False)
+                return True, result.stdout or ""
             else:
                 console.print(f"[red]✗ Playbook execution failed[/red]")
-                console.print(f"[red]{result.stderr}[/red]")
-                return False, result.stderr
+                # Show both stdout and stderr for troubleshooting
+                if result.stdout:
+                    console.print(result.stdout, style="yellow", markup=False)
+                if result.stderr:
+                    console.print(result.stderr, style="red", markup=False)
+                return False, (result.stderr or result.stdout or "Unknown error")
                 
         except subprocess.TimeoutExpired:
             error_msg = "Playbook execution timed out (>10 minutes)"

@@ -79,8 +79,8 @@ class RemediationBridge:
                     task_name += f" - {suggestion.notes[:50]}"
                 tasks.append(AnsibleTask(
                     name=task_name,
-                    module="command",
-                    params={"cmd": command},
+                    module="shell",
+                    params={"cmd": command, "executable": "/bin/bash"},
                     tags=[f"vuln_{suggestion.id}"]
                 ))
         
