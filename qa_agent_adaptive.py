@@ -18,25 +18,21 @@ import json
 import time
 import random
 from pathlib import Path
-from typing import List, Dict, Any, Optional, Tuple
+from typing import Callable, List, Dict, Any, Optional, Tuple
 from datetime import datetime
 import subprocess
 import shlex
+import requests
 from rich.console import Console
 from rich.panel import Panel
 from rich.table import Table
 from rich.prompt import Confirm
 from dotenv import load_dotenv
 
-from schemas import Vulnerability, RemediationSuggestion
+from schemas import Vulnerability, RemediationSuggestion, RunCommandResult, ToolVerdict
 from openscap_cli import OpenSCAPScanner
 from parse_openscap import parse_openscap
 from remediation_bridge import RemediationBridge
-from qa_loop import AnsibleExecutor
-from pydantic_ai import Agent, NativeOutput
-from pydantic_ai.models.openai import OpenAIChatModel
-from pydantic_ai.providers.openai import OpenAIProvider
-
 console = Console()
 
 load_dotenv()
@@ -57,19 +53,23 @@ class AdaptiveQAAgent:
         interactive: bool = True,
     ):
         self.scanner = scanner
-        self.ansible_executor = AnsibleExecutor(ansible_inventory)
-        self.ssh_executor = SSHExecutor(
+        shell_timeout = int(os.getenv('QA_AGENT_COMMAND_TIMEOUT', '120'))
+        self.shell_executor = ShellCommandExecutor(
             host=scanner.target_host,
-            user=scanner.ssh_user,
+            user=scanner.ssh_user or 'root',
             key=scanner.ssh_key,
-            port=scanner.ssh_port,
-            sudo_password=sudo_password
+            port=int(getattr(scanner, 'ssh_port', 22) or 22),
+            sudo_password=sudo_password,
+            command_timeout=shell_timeout,
+            max_output_chars=int(os.getenv('QA_AGENT_MAX_OUTPUT_CHARS', '8000'))
         )
         self.work_dir = Path(work_dir)
         self.work_dir.mkdir(exist_ok=True, parents=True)
         self.scan_profile = scan_profile
         self.scan_datastream = scan_datastream
         self.sudo_password = sudo_password
+        self.initial_fail_count: Optional[int] = None
+        self.current_fail_count: Optional[int] = None
         self.max_attempts = max_attempts
         self.interactive = interactive
         
@@ -89,42 +89,52 @@ class AdaptiveQAAgent:
         self.failure_patterns = []
     
     def _init_llm_agent(self):
-        """Initialize adaptive LLM agent"""
-        # Load environment variables
+        """Initialize adaptive LLM agent that can call local shell tools."""
         api_key = os.getenv('OPENROUTER_API_KEY')
         if not api_key:
             raise ValueError("OPENROUTER_API_KEY not found in .env file!")
+
         model_name = os.getenv('OPENROUTER_MODEL')
         if not model_name:
             raise ValueError("OPENROUTER_MODEL not found in .env file!")
-        
-        # Configure OpenRouter model using OpenAIProvider
-        model = OpenAIChatModel(
+
+        base_url = os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1').rstrip('/')
+        max_tool_iterations = int(os.getenv('QA_AGENT_MAX_TOOL_CALLS', '24'))
+        request_timeout = int(os.getenv('QA_AGENT_LLM_TIMEOUT', '90'))
+
+        system_prompt = (
+            "You are an adaptive security remediation agent working on Rocky Linux 10. "
+            "You operate strictly through the provided tools:\n"
+            "1. Use `run_command` to execute EXACTLY ONE shell command at a time. "
+            "   - Do NOT chain commands with &&, ;, or multiline scripts.\n"
+            "   - All commands run as root. Never prefix with sudo.\n"
+            "   - If a command fails, inspect stdout/stderr and try a different approach.\n"
+            "2. When you finish (either resolved or blocked), call `verdict` with a clear message and resolved=true/false.\n"
+            "You must reason step-by-step, calling `run_command` between thoughts. "
+            "Focus on one vulnerability at a time, be precise, prefer idempotent fixes, "
+            "and always include verification commands where possible."
+        )
+
+        return ToolCallingLLM(
             model_name=model_name,
-            provider=OpenAIProvider(
-                base_url=os.getenv('OPENROUTER_BASE_URL', 'https://openrouter.ai/api/v1'),
-                api_key=api_key
-            )
+            base_url=base_url,
+            api_key=api_key,
+            system_prompt=system_prompt,
+            shell_executor=self.shell_executor,
+            command_normalizer=self._normalize_command,
+            max_tool_iterations=max_tool_iterations,
+            request_timeout=request_timeout
         )
-        
-        agent = Agent(
-            model,
-            output_type=NativeOutput(RemediationSuggestion, strict=True),
-            system_prompt=(
-                "You are an adaptive security remediation agent. "
-                "When a fix fails, you learn from the error and suggest a different approach. "
-                "Analyze error messages, consider alternative methods, and try different strategies. "
-                "Your goal is to successfully fix security vulnerabilities, adapting your approach based on feedback."
-            )
-        )
-        return agent
     
-    def scan_for_vulnerability(self, vuln: Vulnerability) -> bool:
+    def scan_for_vulnerability(self, vuln: Vulnerability) -> Tuple[bool, Optional[int]]:
         """Check if a specific vulnerability still exists.
         
-        Returns True if vulnerability still exists, False if fixed.
-        Verification is performed by rescanning and checking the specific
-        OpenSCAP rule result for this vulnerability.
+        Returns:
+            (still_exists, current_fail_count)
+            
+        - still_exists: True if vulnerability still exists, False if fixed.
+        - current_fail_count: total number of failing/error OpenSCAP rules
+          in this verification scan (None if unavailable).
         """
         console.print(f"[cyan]🔍 Checking if {vuln.id} is fixed...[/cyan]")
         
@@ -141,7 +151,8 @@ class AdaptiveQAAgent:
         
         if not success:
             console.print("[yellow]⚠ Could not verify, assuming not fixed[/yellow]")
-            return True  # Assume still exists if scan fails
+            # Preserve last known fail count if we have one
+            return True, self.current_fail_count
         
         # Download and parse
         self.scanner.download_results(f"/tmp/verify_{vuln.id}.xml", str(scan_file))
@@ -186,399 +197,77 @@ class AdaptiveQAAgent:
                     if still_exists:
                         break
         
-        return still_exists
+        current_fail_count = len(current_vulns)
+        return still_exists, current_fail_count
     
-    def get_initial_remediation(self, vuln: Vulnerability) -> RemediationSuggestion:
-        """Get initial remediation suggestion from LLM"""
-        console.print("[cyan]🤖 Getting initial remediation from AI...[/cyan]")
-        
-        # Parse the OpenSCAP rule name to understand what it's checking
+    def _build_agent_prompt(self, vuln: Vulnerability, previous_attempts: List[Dict[str, Any]]) -> str:
+        """Construct the user-facing prompt for the agentic remediation loop."""
         rule_name = vuln.title.replace('xccdf_org.ssgproject.content_rule_', '')
+        description = (getattr(vuln, 'description', '') or '').strip()
+        recommendation = (getattr(vuln, 'recommendation', '') or '').strip()
 
-        # Always use LLM for remediation (built-in remediations disabled)
-        # builtin = self.get_rule_based_remediation(vuln, rule_name)
-        # if builtin is not None:
-        #     console.print("[green]Using built-in remediation for this rule[/green]")
-        #     return builtin
-        
-        # Include description and recommendation if available
-        description = getattr(vuln, 'description', '') or ''
-        recommendation = getattr(vuln, 'recommendation', '') or ''
-        
-        prompt = f"""You are remediating an OpenSCAP security compliance finding on Rocky Linux 10 (RHEL-based).
+        lines = [
+            "You are remediating ONE OpenSCAP finding on Rocky Linux 10.",
+            "",
+            "VULNERABILITY:",
+            f"- Rule Name: {rule_name}",
+            f"- Rule ID: {vuln.title}",
+            f"- Severity: {vuln.severity} (0=info, 4=critical)",
+            f"- Host: {vuln.host}",
+        ]
 
-VULNERABILITY DETAILS:
-- Rule Name: {rule_name}
-- Full Rule ID: {vuln.title}
-- Severity: {vuln.severity} (0=info, 1=low, 2=medium, 3=high, 4=critical)
-- Host: {vuln.host}
-{f"- Description: {description[:500]}" if description else ""}
-{f"- Recommendation: {recommendation[:500]}" if recommendation else ""}
+        if description:
+            lines.append(f"- Description: {description[:600]}")
+        if recommendation:
+            lines.append(f"- Recommendation: {recommendation[:600]}")
 
-SYSTEM INFORMATION:
-- OS: Rocky Linux 10 (RHEL-based, uses dnf/yum, systemd)
-- Package Manager: dnf (NOT apt, NOT apt-get).
-- Init System: systemd
-- Configuration: Files typically in /etc/
+        lines.extend([
+            "",
+            "ENVIRONMENT FACTS:",
+            "- OS: Rocky Linux 10 (dnf, systemd)",
+            "- Commands run remotely on this host via SSH; NEVER add sudo (already root).",
+            "- Use dnf for packages, systemctl for services, sed/echo/cat for configs.",
+            "- Prefer idempotent commands and include verification steps.",
+        ])
 
-TASK:
-Based on the rule name "{rule_name}", determine what OpenSCAP is checking and provide the EXACT commands needed to fix it.
-
-IMPORTANT EXECUTION CONTEXT:
-- Your commands will be executed as a SINGLE SHELL SCRIPT running as ROOT.
-- You can use variables, loops, and change directories (cd) - state IS preserved within the script.
-- DO NOT include 'sudo' in your commands - the entire script runs as root.
-- If you need to edit files, use 'sed', 'echo', or 'cat'.
-
-COMMON OPENSCAP RULE PATTERNS AND REMEDIATION:
-
-1. Package Installation Rules (package_*_installed):
-   - Command: dnf install -y <package-name>
-   - Verify: rpm -q <package-name>
-   - Example: "package_aide_installed" → dnf install -y aide
-
-2. Service Rules (service_*_enabled, service_*_running):
-   - Enable: systemctl enable <service>
-   - Start: systemctl start <service>
-   - Verify: systemctl is-enabled <service> && systemctl is-active <service>
-   - Example: "service_auditd_enabled" → systemctl enable auditd && systemctl start auditd
-
-3. AIDE Rules (aide_*):
-   - Install: dnf install -y aide
-   - Initialize: aide --init
-   - Copy database: if [ -f /var/lib/aide/aide.db.new.gz ]; then cp -f /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz; fi
-   - CRITICAL: DO NOT use 'systemctl ... aide.service' (this unit does not exist)
-   - Example: "aide_build_database" → dnf install -y aide && aide --init && if [ -f /var/lib/aide/aide.db.new.gz ]; then cp -f /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz; fi
-
-4. Audit Rules (auditd_*):
-   - Install: dnf install -y audit
-   - Configure: Edit /etc/audit/auditd.conf (use sed or echo)
-   - Enable/Start: systemctl enable auditd && systemctl start auditd
-   - Restart after config: systemctl restart auditd
-
-5. Sysctl Rules (sysctl_*):
-   - Set immediately: sysctl -w <key>=<value>
-   - Persist: echo "<key>=<value>" >> /etc/sysctl.d/99-custom.conf
-   - Load: sysctl --system
-   - Verify: sysctl <key>
-
-6. File Permission Rules (file_permissions_*, file_ownership_*):
-   - Set permissions: chmod <mode> <file>
-   - Set ownership: chown <user>:<group> <file>
-   - Verify: stat -c %a <file> (for permissions)
-   - Common modes: 0600 (owner read/write), 0644 (owner read/write, others read), 0755 (executable)
-
-7. SSH Configuration Rules (sshd_*):
-   - Edit: /etc/ssh/sshd_config
-   - Use sed or echo to modify settings
-   - Restart: systemctl restart sshd
-   - Verify: sshd -t (test config)
-
-8. GRUB Rules (grub2_*):
-   - Edit: /etc/default/grub or /boot/grub2/grub.cfg
-   - Regenerate: grub2-mkconfig -o /boot/grub2/grub.cfg
-   - May require reboot
-
-9. Firewall Rules (firewalld_*):
-   - Install: dnf install -y firewalld
-   - Enable/Start: systemctl enable firewalld && systemctl start firewalld
-   - Configure zones/rules as needed
-
-IMPORTANT GUIDELINES:
-- Use DNF, NOT apt or apt-get
-- Be SPECIFIC and COMPLETE - don't just install packages, configure them properly
-- Include verification commands where appropriate
-- Use idempotent commands when possible (check before modifying)
-- For configuration files, use sed or echo with proper escaping
-- Always restart services after configuration changes (unless service refuses restart - use alternatives like augenrules --load for auditd)
-- DO NOT reference 'aide.service' systemd unit (it does not exist)
-- For file redirections: use echo 'text' >> /path/to/file
-- For conditionals: use if condition; then action; fi
-- For audit rules: prefer augenrules --load over systemctl restart auditd (auditd may refuse restart)
-
-Provide the EXACT commands that will make this OpenSCAP check pass. Return commands as a list, in the order they should be executed.
-"""
-        
-        # Log the prompt
-        prompt_log_file = self.work_dir / f"llm_prompt_{vuln.id}_initial.txt"
-        prompt_log_file.write_text(prompt, encoding='utf-8')
-        
-        result = self.llm_agent.run_sync(prompt)
-        
-        # Log the response
-        response_log_file = self.work_dir / f"llm_response_{vuln.id}_initial.json"
-        
-        # Handle usage stats - RunUsage doesn't have model_dump(), convert to dict manually
-        usage_data = None
-        try:
-            if hasattr(result, 'usage') and callable(result.usage):
-                usage = result.usage()
-                usage_data = {
-                    'requests': getattr(usage, 'requests', None),
-                    'input_tokens': getattr(usage, 'input_tokens', None),
-                    'output_tokens': getattr(usage, 'output_tokens', None),
-                }
-        except Exception:
-            usage_data = None
-        
-        response_log_file.write_text(json.dumps({
-            'vuln_id': vuln.id,
-            'attempt': 1,
-            'remediation': result.output.model_dump() if hasattr(result.output, 'model_dump') else str(result.output),
-            'usage': usage_data
-        }, indent=2), encoding='utf-8')
-        
-        return result.output
-
-    def get_rule_based_remediation(self, vuln: Vulnerability, rule_name: str) -> Optional[RemediationSuggestion]:
-        """Return a deterministic remediation for known OpenSCAP rules.
-
-        This improves reliability by applying well-known fixes on RHEL/Rocky.
-        Returns None if no built-in remediation is available.
-        """
-        rn = rule_name
-        cmds: List[str] = []
-        notes = ""
-
-        # AIDE rules
-        if rn == 'package_aide_installed' or 'aide_installed' in rn:
-            cmds = [
-                'dnf install -y aide',
-            ]
-            notes = 'Install AIDE using dnf on Rocky/RHEL.'
-        elif rn == 'aide_build_database' or 'aide_build' in rn or 'aide_init' in rn:
-            cmds = [
-                'dnf install -y aide',
-                'aide --init',
-                'if [ -f /var/lib/aide/aide.db.new.gz ]; then cp -f /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz; fi'
-            ]
-            notes = 'Initialize AIDE database after installation.'
-        elif 'aide_check_audit_tools' in rn:
-            cmds = [
-                'cp -n /etc/aide.conf /etc/aide.conf.bak || true',
-                "grep -qE '^/sbin/audit\\* ' /etc/aide.conf || echo '/sbin/audit* p+i+n+u+g+s+m+c+sha256' >> /etc/aide.conf",
-                "grep -qE '^/usr/sbin/audit\\* ' /etc/aide.conf || echo '/usr/sbin/audit* p+i+n+u+g+s+m+c+sha256' >> /etc/aide.conf",
-                'aide --init',
-                'if [ -f /var/lib/aide/aide.db.new.gz ]; then cp -f /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz; fi',
-                'aide --check'
-            ]
-            notes = 'Ensure audit tools are monitored by AIDE and reinitialize database.'
-
-        # Auditd rules
-        elif rn.startswith('package_audit') or rn.startswith('package_auditd'):
-            cmds = [
-                'dnf install -y audit',
-            ]
-            notes = 'Install audit package.'
-        elif rn.startswith('service_auditd_enabled') or 'auditd_service' in rn:
-            cmds = [
-                'systemctl enable auditd',
-                'systemctl start auditd'
-            ]
-            notes = 'Ensure auditd is enabled and running.'
-        elif 'auditd_data_retention_space_left_action' in rn:
-            cmds = [
-                "sed -ri 's/^[[:space:]]*space_left_action[[:space:]]*=.*/space_left_action = email/' /etc/audit/auditd.conf",
-                "sed -ri 's/^[[:space:]]*action_mail_acct[[:space:]]*=.*/action_mail_acct = root/' /etc/audit/auditd.conf",
-                'systemctl restart auditd'
-            ]
-            notes = 'Configure auditd retention action and restart.'
-
-        # Firewalld rules
-        elif rn == 'package_firewalld_installed' or 'firewalld_installed' in rn:
-            cmds = [
-                'dnf install -y firewalld',
-            ]
-            notes = 'Install firewalld.'
-        elif rn == 'service_firewalld_enabled' or 'firewalld_enabled' in rn:
-            cmds = [
-                'systemctl enable firewalld',
-                'systemctl start firewalld'
-            ]
-            notes = 'Enable and start firewalld.'
-
-        # SSH rules examples
-        elif 'sshd_disable_root_login' in rn or 'permitrootlogin' in rn:
-            cmds = [
-                "if grep -qi '^[[:space:]]*PermitRootLogin' /etc/ssh/sshd_config; then sed -ri 's/^[[:space:]]*PermitRootLogin.*/PermitRootLogin no/' /etc/ssh/sshd_config; else echo 'PermitRootLogin no' >> /etc/ssh/sshd_config; fi",
-                'systemctl restart sshd'
-            ]
-            notes = 'Disable SSH root login and restart sshd.'
-
-        # Sysctl generic pattern example
-        elif rn.startswith('sysctl_'):
-            # Attempt to infer key=value from rule name is unreliable; let LLM handle unless specified
-            cmds = []
-
-        if cmds:
-            return RemediationSuggestion(id=vuln.id, proposed_commands=cmds, notes=notes)
-        return None
-    
-    def get_adaptive_remediation(self, vuln: Vulnerability, 
-                                 previous_attempts: List[Dict],
-                                 error_message: str) -> RemediationSuggestion:
-        """Get adaptive remediation based on previous failures"""
-        console.print("[yellow]🔄 Getting adaptive remediation (learning from failure)...[/yellow]")
-        
-        # Build detailed context from previous attempts with error analysis
-        attempt_history_parts = []
-        for i, att in enumerate(previous_attempts):
-            attempt_info = f"Attempt {i+1}:\n"
-            attempt_info += f"Commands executed:\n"
-            for j, cmd in enumerate(att.get('commands', []), 1):
-                attempt_info += f"  {j}. {cmd}\n"
-            
-            attempt_info += f"Execution Status: {'✓ Succeeded' if att.get('apply_success') else '✗ Failed'}\n"
-            attempt_info += f"OpenSCAP Verification: {'✓ FIXED' if att.get('verified', False) else '✗ STILL VULNERABLE' if att.get('verified') is not None else '⚠ Not verified'}\n"
-
-            # Summarize error categories, if present
-            categories = att.get('error_categories') or []
-            if categories:
-                attempt_info += f"Error Categories: {', '.join(categories)}\n"
-            
-            # Include detailed command results if available
-            detailed_results = att.get('detailed_results', [])
-            if detailed_results:
-                attempt_info += f"\nCommand-by-command results:\n"
-                for cmd_result in detailed_results:
-                    cmd_info = f"  Command: {cmd_result.get('command', 'unknown')}\n"
-                    cmd_info += f"    Exit Code: {cmd_result.get('exit_code', 'N/A')}\n"
-                    cmd_info += f"    Success: {cmd_result.get('success', False)}\n"
-                    if cmd_result.get('error_type'):
-                        cmd_info += f"    Error Type: {cmd_result.get('error_type')}\n"
-                    if cmd_result.get('stdout'):
-                        stdout_preview = cmd_result.get('stdout', '')[:200]
-                        cmd_info += f"    Stdout: {stdout_preview}{'...' if len(cmd_result.get('stdout', '')) > 200 else ''}\n"
-                    if cmd_result.get('stderr'):
-                        stderr_preview = cmd_result.get('stderr', '')[:200]
-                        cmd_info += f"    Stderr: {stderr_preview}{'...' if len(cmd_result.get('stderr', '')) > 200 else ''}\n"
-                    attempt_info += cmd_info + "\n"
-            else:
-                # Fallback to error message
-                error_msg = att.get('error') or 'No error information available'
-                if error_msg:
-                    error_preview = error_msg[:500] if len(str(error_msg)) > 500 else str(error_msg)
-                    attempt_info += f"Error Output: {error_preview}\n"
+        if previous_attempts:
+            lines.append("")
+            lines.append(f"PREVIOUS ATTEMPTS ({len(previous_attempts)} total, showing last {min(3, len(previous_attempts))}):")
+            for att in previous_attempts[-3:]:
+                lines.append(f"* Attempt {att.get('attempt')}:")
+                cmds = att.get('commands') or []
+                if cmds:
+                    lines.append("  Commands:")
+                    for cmd in cmds[-4:]:
+                        lines.append(f"    - {cmd}")
+                categories = att.get('error_categories') or []
+                if categories:
+                    lines.append(f"  Error categories: {', '.join(categories)}")
+                error_text = att.get('error')
+                if error_text:
+                    preview = str(error_text).strip().replace("\r", "")
+                    lines.append(f"  Output/Error: {preview[:400]}")
+                verified = att.get('verified')
+                if verified is True:
+                    lines.append("  Result: Verified fixed (unexpected regression).")
+                elif verified is False:
+                    lines.append("  Result: Scan shows still failing.")
                 else:
-                    attempt_info += "Error Output: No error information available\n"
-            
-            attempt_history_parts.append(attempt_info)
-        
-        attempt_history = "\n\n".join(attempt_history_parts)
-        
-        rule_name = vuln.title.replace('xccdf_org.ssgproject.content_rule_', '')
-        
-        prompt = f"""PREVIOUS REMEDIATION ATTEMPT FAILED! Analyze what went wrong and try a COMPLETELY DIFFERENT approach.
+                    lines.append("  Result: Verification skipped.")
 
-SYSTEM: Rocky Linux 10 (RHEL-based, uses dnf, systemd)
+        lines.extend([
+            "",
+            "GUIDANCE:",
+            "- Call `run_command` for each discrete step (install, configure, verify).",
+            "- Do NOT chain commands with && or ; .",
+            "- Review stdout/stderr after every command and adjust strategy as needed.",
+            "- Common patterns: package_* → dnf install -y pkg; service_* → systemctl enable/start svc; "
+            "sysctl_* → sysctl -w + persist in /etc/sysctl.d; aide_* → install/init/copy database; "
+            "auditd_* → edit /etc/audit/auditd.conf then augenrules --load; sshd_* → edit /etc/ssh/sshd_config + systemctl restart sshd.",
+            "- Finish by calling `verdict` with resolved=true when confident, or resolved=false if automation is not possible.",
+        ])
 
-VULNERABILITY:
-- Rule: {rule_name}
-- OpenSCAP Rule ID: {vuln.title}
-- Current Status: STILL VULNERABLE after {len(previous_attempts)} attempt(s)
-
-WHAT HAPPENED:
-{attempt_history}
-
-ANALYSIS REQUIRED:
-1. WHY did the previous approach fail? Look at exit codes and error messages.
-2. Was the package/service actually installed/configured? Check stdout for confirmation.
-3. Did we miss a configuration step? Review what OpenSCAP is actually checking.
-4. Is there a different way to achieve the same compliance?
-5. Are there permission issues? Check stderr for "Permission denied" or "Access denied".
-6. Are commands being executed in the right order? Some fixes require multiple steps.
-
-COMMON OPENSCAP ISSUES AND SOLUTIONS:
-- "package_*_installed" rules: 
-  * Package must be installed: dnf install -y <package>
-  * Some packages need configuration after installation
-  * Verify with: rpm -q <package>
-  
-- "aide_*" rules: 
-  * Install: dnf install -y aide
-  * Initialize: aide --init
-  * Copy database: if [ -f /var/lib/aide/aide.db.new.gz ]; then cp -f /var/lib/aide/aide.db.new.gz /var/lib/aide/aide.db.gz; fi
-  * DO NOT use 'systemctl ... aide.service' (no such unit exists)
-  
-- "auditd_*" rules: 
-  * Install: dnf install -y audit
-  * Edit /etc/audit/auditd.conf with correct settings
-  * Enable and start: systemctl enable auditd && systemctl start auditd
-  * IMPORTANT: auditd may refuse manual restart - use "augenrules --load" instead of "systemctl restart auditd"
-  * Verify: systemctl status auditd
-  
-- "service_*" rules: 
-  * Service must be BOTH enabled AND started
-  * Use: systemctl enable <service> && systemctl start <service>
-  * Verify: systemctl is-enabled <service> && systemctl is-active <service>
-  
-- "sysctl_*" rules: 
-  * Set immediately: sysctl -w key=value
-  * Persist: echo "key=value" >> /etc/sysctl.d/99-custom.conf
-  * Load: sysctl --system
-  * Verify: sysctl key
-  
-- "file_permissions_*" rules: 
-  * Check exact permissions required (usually mode 0600 or 0644)
-  * Use: chmod <mode> <file>
-  * Verify: stat -c %a <file>
-  
-- "grub2_*" rules: 
-  * Edit /etc/default/grub or /boot/grub2/grub.cfg
-  * Must run: grub2-mkconfig -o /boot/grub2/grub.cfg
-  * Reboot may be required
-
-IMPORTANT EXECUTION CONTEXT:
-- Your commands will be executed as a SINGLE SHELL SCRIPT running as ROOT.
-- You can use variables, loops, and change directories (cd) - state IS preserved within the script.
-- DO NOT include 'sudo' in your commands - the entire script runs as root.
-
-COMMON FAILURE PATTERNS AND SOLUTIONS:
-- "syntax error near unexpected token `then'": Check your if/then syntax.
-- "Permission denied" on redirections: The script runs as root, so this shouldn't happen unless the file is immutable (chattr +i).
-- "Operation refused" on service restart: Use alternatives (e.g., augenrules --load for auditd instead of restart)
-- "Operation not permitted" on chown/chmod: May need SELinux context or different approach
-- Commands succeed but OpenSCAP still fails: Check exact requirements (permissions, ownership, configuration values)
-- For audit rules: If systemctl restart auditd fails, use "augenrules --load" to reload rules
-
-YOUR TASK:
-Analyze the error messages, exit codes, and command outputs above. Suggest a DIFFERENT strategy that:
-1. Addresses the specific failure reason (syntax error, permission issue, missing step, wrong command, etc.)
-2. Is MORE SPECIFIC and COMPLETE than the previous attempt
-3. Includes verification commands where appropriate
-4. Handles edge cases that might have caused the failure
-"""
-        
-        # Log the prompt for debugging
-        prompt_log_file = self.work_dir / f"llm_prompt_{vuln.id}_attempt{len(previous_attempts)+1}.txt"
-        prompt_log_file.write_text(prompt, encoding='utf-8')
-        
-        result = self.llm_agent.run_sync(prompt)
-        
-        # Log the response
-        response_log_file = self.work_dir / f"llm_response_{vuln.id}_attempt{len(previous_attempts)+1}.json"
-        
-        # Handle usage stats - RunUsage doesn't have model_dump(), convert to dict manually
-        usage_data = None
-        try:
-            if hasattr(result, 'usage') and callable(result.usage):
-                usage = result.usage()
-                usage_data = {
-                    'requests': getattr(usage, 'requests', None),
-                    'input_tokens': getattr(usage, 'input_tokens', None),
-                    'output_tokens': getattr(usage, 'output_tokens', None),
-                }
-        except Exception:
-            usage_data = None
-        
-        response_log_file.write_text(json.dumps({
-            'vuln_id': vuln.id,
-            'attempt': len(previous_attempts) + 1,
-            'remediation': result.output.model_dump() if hasattr(result.output, 'model_dump') else str(result.output),
-            'usage': usage_data
-        }, indent=2), encoding='utf-8')
-        
-        return result.output
+        return "\n".join(lines)
     
     def _write_commands_file(self, vuln: Vulnerability, attempt_num: int, commands: List[str]) -> Path:
         cmds_path = self.work_dir / f"fix_{vuln.id}_attempt{attempt_num}.cmds.txt"
@@ -618,90 +307,97 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
 
         return cmd
 
-    def apply_remediation(self, vuln: Vulnerability, 
-                         remediation: RemediationSuggestion,
-                         attempt_num: int) -> Tuple[bool, str, List[Dict[str, Any]]]:
-        """Apply remediation and return (success, combined_output, detailed_results)"""
-        console.print(f"[cyan]🔧 Applying remediation (Attempt {attempt_num}/{self.max_attempts})...[/cyan]")
-        
-        # Show what we're doing
-        console.print("\n[yellow]Commands to execute:[/yellow]")
-        for i, cmd in enumerate(remediation.proposed_commands, 1):
-            console.print(f"  {i}. {cmd}")
-
-        # Save commands file (filter out invalid aide.service operations)
-        filtered_cmds: List[str] = []
-        for c in remediation.proposed_commands:
-            lc = c.lower()
-            if "systemctl" in lc and "aide" in lc:
+    def _annotate_error_categories(self, detailed_results: List[Dict[str, Any]]) -> None:
+        """Tag each command result with heuristic error categories."""
+        for result_detail in detailed_results:
+            if result_detail.get('success', False):
                 continue
-            filtered_cmds.append(c)
-        if not filtered_cmds:
-            filtered_cmds = remediation.proposed_commands
 
-        # Normalize commands for this environment (apt→dnf, service→systemctl, etc.)
-        normalized_cmds = [self._normalize_command(c) for c in filtered_cmds]
+            stderr_full = (result_detail.get('stderr') or '').lower()
+            stdout_full = (result_detail.get('stdout') or '').lower()
+            cmd = (result_detail.get('command') or '')
 
-        cmds_file = self._write_commands_file(vuln, attempt_num, normalized_cmds)
-        console.print(f"\n[blue]Commands file:[/blue] {cmds_file}")
+            categories: List[str] = []
 
-        # Execute commands directly over SSH via script
-        # Note: We no longer need _format_sudo_command because the SSHExecutor wraps the whole script in sudo
-        success, combined_output, detailed_results = self.ssh_executor.execute_commands(normalized_cmds)
+            if 'systemctl' in cmd.lower() and 'restart' in cmd.lower():
+                if 'refused' in stderr_full or 'operation refused' in stderr_full:
+                    console.print(f"\n[yellow]⚠ Service restart refused for: {cmd}[/yellow]")
+                    console.print("[yellow]Consider alternatives like 'augenrules --load' for auditd[/yellow]")
+                    categories.append('service_restart_refused')
 
-        # Save log
-        log_file = self.work_dir / f"fix_{vuln.id}_attempt{attempt_num}.ssh.log"
-        log_file.write_text(combined_output, encoding='utf-8')
-        
-        # Save detailed results as JSON
+            if 'permission denied' in stderr_full or 'operation not permitted' in stderr_full:
+                console.print(f"\n[yellow]⚠ Permission issue detected for: {cmd}[/yellow]")
+                categories.append('permission_denied')
+                if '/etc/cron.d' in cmd.lower() or '/etc/cron.d' in stderr_full:
+                    categories.append('cron_system_file_protected')
+
+            if 'syntax error' in stderr_full:
+                console.print(f"\n[yellow]⚠ Syntax error detected in command: {cmd}[/yellow]")
+                categories.append('syntax_error')
+
+            if not categories:
+                categories.append('command_failed')
+
+            result_detail['error_categories'] = categories
+
+    def apply_remediation(
+        self,
+        vuln: Vulnerability,
+        attempt_num: int,
+        previous_attempts: List[Dict[str, Any]]
+    ) -> Tuple[bool, str, List[Dict[str, Any]], List[str], Optional[ToolVerdict]]:
+        """Run an agentic remediation attempt via tool-calling shell interface."""
+        console.print(f"[cyan]🔧 Agentic remediation (Attempt {attempt_num}/{self.max_attempts})[/cyan]")
+
+        prompt = self._build_agent_prompt(vuln, previous_attempts)
+        session_label = f"{vuln.id}_attempt{attempt_num}"
+
+        prompt_file = self.work_dir / f"llm_prompt_{session_label}.txt"
+        prompt_file.write_text(prompt, encoding='utf-8')
+
+        try:
+            session_result = self.llm_agent.run_session(
+                user_prompt=prompt,
+                session_label=session_label
+            )
+        except Exception as exc:
+            combined_output = f"LLM/tool execution failed: {exc}"
+            console.print(f"[red]Tool call failed:[/red] {exc}")
+            return False, combined_output, [], [], None
+
+        transcript_file = self.work_dir / f"llm_transcript_{session_label}.json"
+        transcript_file.write_text(json.dumps(session_result.get('transcript', []), indent=2), encoding='utf-8')
+
+        commands = session_result.get('commands', [])
+        detailed_results = session_result.get('detailed_results', [])
+        combined_output = session_result.get('combined_output') or ''
+        verdict_data = session_result.get('verdict')
+        verdict = None
+        if verdict_data:
+            verdict = ToolVerdict(**verdict_data)
+            console.print(f"\n[green]Verdict:[/green] {verdict.message} (resolved={verdict.resolved})")
+
+        if commands:
+            cmds_file = self._write_commands_file(vuln, attempt_num, commands)
+            console.print(f"\n[blue]Commands executed:[/blue] {cmds_file}")
+        else:
+            console.print("\n[yellow]No commands executed during this attempt[/yellow]")
+
+        log_file = self.work_dir / f"fix_{vuln.id}_attempt{attempt_num}.shell.log"
+        log_file.write_text(combined_output or "<no command output>", encoding='utf-8')
+
         detailed_log_file = self.work_dir / f"fix_{vuln.id}_attempt{attempt_num}.detailed.json"
         detailed_log_file.write_text(json.dumps(detailed_results, indent=2), encoding='utf-8')
 
-        # Show output clearly
-        console.print("\n[magenta]Remote Output (Attempt {}/{}):[/magenta]".format(attempt_num, self.max_attempts))
+        console.print(f"\n[magenta]Agent Output (Attempt {attempt_num}/{self.max_attempts}):[/magenta]")
         if combined_output:
             console.print(combined_output, markup=False)
         else:
             console.print("[dim]<no output>[/dim]")
-        
-        # Analyze detailed results for common issues and classify failures
-        for result_detail in detailed_results:
-            if not result_detail.get('success', False):
-                stderr_full = result_detail.get('stderr', '') or ''
-                stdout_full = result_detail.get('stdout', '') or ''
-                stderr = stderr_full.lower()
-                stdout = stdout_full.lower()
-                cmd = result_detail.get('command', '')
 
-                categories: List[str] = []
+        apply_success = session_result.get('apply_success', False)
 
-                # Check for service restart failures (especially auditd)
-                if 'systemctl' in cmd.lower() and 'restart' in cmd.lower():
-                    if 'refused' in stderr or 'operation refused' in stderr:
-                        console.print(f"\n[yellow]⚠ Service restart refused for: {cmd}[/yellow]")
-                        console.print("[yellow]This is common for auditd - consider using 'augenrules --load' instead[/yellow]")
-                        categories.append('service_restart_refused')
-
-                # Permission / immutable issues
-                if 'permission denied' in stderr or 'operation not permitted' in stderr:
-                    console.print(f"\n[yellow]⚠ Permission issue detected for: {cmd}[/yellow]")
-                    categories.append('permission_denied')
-                    if '/etc/cron.d' in cmd or '/etc/cron.d' in stderr_full:
-                        categories.append('cron_system_file_protected')
-
-                # Syntax errors (should be mitigated by bash -c wrapping)
-                if 'syntax error' in stderr:
-                    console.print(f"\n[yellow]⚠ Syntax error detected - shell syntax likely malformed[/yellow]")
-                    categories.append('syntax_error')
-
-                # Fallback generic failure category if nothing specific matched
-                if not categories:
-                    categories.append('command_failed')
-
-                # Store categories on the result detail for downstream analysis
-                result_detail['error_categories'] = categories
-
-        return success, combined_output, detailed_results
+        return apply_success, combined_output, detailed_results, commands, verdict
 
     def process_vulnerability_adaptively(self, vuln: Vulnerability) -> Dict:
         """Process a vulnerability with adaptive retries
@@ -727,6 +423,20 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
         for attempt_num in range(1, self.max_attempts + 1):
             console.print(f"\n[bold yellow]═══ Attempt {attempt_num}/{self.max_attempts} ═══[/bold yellow]\n")
 
+            # Auto skip partition-style requirements that cannot be automated safely
+            rule_name_lower = vuln.title.lower()
+            partition_keywords = ["partition_for_", "separate partition", "separate filesystem"]
+            if attempt_num == 1 and any(keyword in rule_name_lower for keyword in partition_keywords):
+                console.print("\n[yellow]⚠ This rule requires partitioning/reinstallation - cannot remediate live[/yellow]")
+                console.print("[yellow]Skipping to next vulnerability...[/yellow]")
+                return {
+                    'vuln_id': vuln.id,
+                    'status': 'skipped',
+                    'reason': 'Partition requirement - requires manual rebuild',
+                    'attempts': attempts,
+                    'fixed_on_attempt': None
+                }
+
             # Heuristic: if we've already hit immutable/permission-protected system files
             # for multiple attempts (e.g., cron system files), treat as non-automatable.
             # Guard against empty attempts list on the first failing iteration.
@@ -747,68 +457,15 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
                         'fixed_on_attempt': None
                     }
             
-            # Get remediation suggestion
-            if attempt_num == 1:
-                # First attempt: get initial suggestion
-                remediation = self.get_initial_remediation(vuln)
-            else:
-                # Subsequent attempts: adaptive based on previous failures
-                last_error = attempts[-1].get('error', 'Unknown error')
-                remediation = self.get_adaptive_remediation(vuln, attempts, last_error)
-            
-            # Show remediation
-            console.print("\n[green]💡 Remediation Plan:[/green]")
-            for i, cmd in enumerate(remediation.proposed_commands, 1):
-                console.print(f"  {i}. [yellow]{cmd}[/yellow]")
-            if remediation.notes:
-                console.print(f"\n[dim]Notes: {remediation.notes}[/dim]")
-            
-            # Check if AI says remediation is not feasible
-            notes_lower = (remediation.notes or "").lower()
-            commands_lower = " ".join(remediation.proposed_commands).lower()
-            rule_name_lower = vuln.title.lower()
-            
-            # Check for partition-related rules (cannot be fixed on running system)
-            partition_keywords = ["partition_for_", "separate partition", "separate filesystem"]
-            is_partition_rule = any(keyword in rule_name_lower for keyword in partition_keywords)
-            
-            skip_keywords = [
-                "not feasible", "cannot be automated", "manual intervention", 
-                "requires manual", "not possible", "cannot fix", 
-                "requires downtime", "data loss", "boot failure",
-                "requires reboot", "during installation", "initial os installation",
-                "repartition", "separate partition", "separate filesystem"
-            ]
-            
-            is_not_feasible = any(keyword in notes_lower or keyword in commands_lower for keyword in skip_keywords)
-            
-            # Auto-skip partition rules
-            if is_partition_rule:
-                console.print("\n[yellow]⚠ This is a partition requirement - cannot be fixed on running system[/yellow]")
-                console.print("[yellow]Skipping to next vulnerability...[/yellow]")
-                return {
-                    'vuln_id': vuln.id,
-                    'status': 'skipped',
-                    'reason': 'Partition requirement - requires repartitioning',
-                    'attempts': attempts,
-                    'fixed_on_attempt': None
-                }
-            
-            if is_not_feasible and len(remediation.proposed_commands) == 0:
-                # AI explicitly says it can't be fixed and provided no commands
-                console.print("\n[yellow]⚠ AI indicates this vulnerability cannot be automatically remediated[/yellow]")
-                console.print("[yellow]Skipping to next vulnerability...[/yellow]")
-                return {
-                    'vuln_id': vuln.id,
-                    'status': 'skipped',
-                    'reason': 'AI indicated remediation not feasible',
-                    'attempts': attempts,
-                    'fixed_on_attempt': None
-                }
-            
             # Apply remediation
             time.sleep(1)  # Brief pause for readability
-            apply_success, output, detailed_results = self.apply_remediation(vuln, remediation, attempt_num)
+            apply_success, output, detailed_results, executed_commands, verdict = self.apply_remediation(
+                vuln,
+                attempt_num,
+                attempts
+            )
+
+            self._annotate_error_categories(detailed_results)
 
             # Aggregate error categories from detailed results (if any)
             aggregated_categories: List[str] = []
@@ -820,11 +477,12 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
             # Record attempt with detailed error information
             attempt_record = {
                 'attempt': attempt_num,
-                'commands': remediation.proposed_commands,
+                'commands': executed_commands,
                 'apply_success': apply_success,
                 'error': output if not apply_success else None,
                 'detailed_results': detailed_results,
                 'error_categories': aggregated_categories,
+                'verdict': verdict.model_dump() if verdict else None,
             }
 
             if not apply_success:
@@ -863,9 +521,24 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
             console.print("\n[cyan]⏳ Waiting 10 seconds for changes to take effect...[/cyan]")
             time.sleep(10)
             
-            # Verify the fix
+            # Verify the fix and update global failing-rule counts
             console.print("\n[cyan]🔍 Verifying fix...[/cyan]")
-            still_vulnerable = self.scan_for_vulnerability(vuln)
+            prev_fail_count = self.current_fail_count if self.current_fail_count is not None else self.initial_fail_count
+            still_vulnerable, fail_count = self.scan_for_vulnerability(vuln)
+            self.current_fail_count = fail_count
+
+            # Show global failing rule count change (can drop by more than one)
+            if self.initial_fail_count is not None and fail_count is not None:
+                total_fixed = self.initial_fail_count - fail_count
+                if prev_fail_count is not None:
+                    delta = prev_fail_count - fail_count
+                    if delta != 0:
+                        console.print(
+                            f"[cyan]OpenSCAP failing rules: {prev_fail_count} → {fail_count} "
+                            f"({'-' if delta > 0 else '+'}{abs(delta)})[/cyan]"
+                        )
+                attempt_record['remaining_failures'] = fail_count
+                attempt_record['total_fixed_so_far'] = total_fixed
             
             attempt_record['verified'] = not still_vulnerable
             attempts.append(attempt_record)
@@ -877,7 +550,7 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
                 # Track success pattern
                 self.success_patterns.append({
                     'vuln_type': vuln.title,
-                    'commands': remediation.proposed_commands,
+                    'commands': executed_commands,
                     'attempt': attempt_num
                 })
                 
@@ -938,11 +611,15 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
         self.scanner.download_results("/tmp/initial_scan.xml", str(scan_file))
         parse_openscap(str(scan_file), str(parsed_file))
         
-        # Load vulnerabilities
+        # Load vulnerabilities (all failed/error OpenSCAP rules)
         with open(parsed_file) as f:
             vulns_data = json.load(f)
         
         vulns = [Vulnerability(**v) for v in vulns_data]
+        # Track global failing rule count across the run
+        self.initial_fail_count = len(vulns_data)
+        self.current_fail_count = self.initial_fail_count
+        console.print(f"[cyan]Initial failing OpenSCAP rules: {self.initial_fail_count}[/cyan]")
         
         # Filter
         filtered = [v for v in vulns if int(v.severity) >= min_severity]
@@ -1114,6 +791,12 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
         console.print(f"[dim]  ✓ Fixed (retry): {len(self.results['fixed_after_retry'])}[/dim]")
         console.print(f"[dim]  ⏭ Skipped: {len(self.results['skipped'])}[/dim]")
         console.print(f"[dim]  ✗ Failed: {len(self.results['failed_all_attempts'])}[/dim]")
+        if self.initial_fail_count is not None and self.current_fail_count is not None:
+            reduced = self.initial_fail_count - self.current_fail_count
+            console.print(
+                f"[dim]  OpenSCAP failing rules: {self.current_fail_count}/{self.initial_fail_count} "
+                f"(reduced by {reduced})[/dim]"
+            )
     
     def _save_results(self, all_results: List[Dict]):
         """Save intermediate results"""
@@ -1163,6 +846,15 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
         )
         
         console.print(table)
+        
+        # Show global failing rule count change if available
+        if self.initial_fail_count is not None:
+            final_count = self.current_fail_count if self.current_fail_count is not None else self.initial_fail_count
+            reduction = self.initial_fail_count - final_count
+            console.print(
+                f"\n[cyan]OpenSCAP failing rules: {self.initial_fail_count} → {final_count} "
+                f"(net change {reduction:+d})[/cyan]"
+            )
         
         # Show learning insights
         if self.success_patterns:
@@ -1238,9 +930,10 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
                     lines.append(playbook_text + ("\n" if not playbook_text.endswith("\n") else ""))
 
                 # Include ansible/ssh output
-                log_path = self.work_dir / f"fix_{vuln_id}_attempt{attempt_num}.ssh.log"
+                log_path = self.work_dir / f"fix_{vuln_id}_attempt{attempt_num}.shell.log"
                 if not log_path.exists():
-                    # Fallback to ansible log if this run used Ansible
+                    log_path = self.work_dir / f"fix_{vuln_id}_attempt{attempt_num}.ssh.log"
+                if not log_path.exists():
                     log_path = self.work_dir / f"fix_{vuln_id}_attempt{attempt_num}.log"
                 lines.append(f"Output (Apply: {'SUCCESS' if apply_success else 'FAILED'} | Verify: {'FIXED' if verified else 'PERSISTING' if verified is not None else 'N/A'}):\n")
                 try:
@@ -1367,144 +1060,329 @@ Analyze the error messages, exit codes, and command outputs above. Suggest a DIF
         c.save()
 
 
-class SSHExecutor:
-    """Execute commands remotely over SSH and capture stdout/stderr."""
-    def __init__(self, host: str, user: str, key: Optional[str], port: int, sudo_password: Optional[str]):
+class ShellCommandExecutor:
+    """Runs individual shell commands on the remote target over SSH."""
+
+    def __init__(
+        self,
+        host: str,
+        user: str,
+        key: Optional[str],
+        port: int = 22,
+        sudo_password: Optional[str] = None,
+        command_timeout: int = 120,
+        max_output_chars: int = 8000,
+    ) -> None:
         self.host = host
-        self.user = user
+        self.user = user or "root"
         self.key = key
-        self.port = port
+        self.port = port or 22
         self.sudo_password = sudo_password
+        self.command_timeout = command_timeout
+        self.max_output_chars = max_output_chars
+
+    def _truncate(self, text: str) -> Tuple[str, bool]:
+        if text and len(text) > self.max_output_chars:
+            return text[: self.max_output_chars] + "\n...[truncated]...", True
+        return text or "", False
 
     def _build_ssh_cmd(self) -> List[str]:
-        cmd = ["ssh"]
+        cmd = [
+            "ssh",
+            "-o",
+            "StrictHostKeyChecking=no",
+            "-o",
+            "UserKnownHostsFile=/dev/null",
+            "-p",
+            str(self.port),
+        ]
         if self.key:
             cmd.extend(["-i", self.key])
-        cmd.extend([
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-p", str(self.port),
-            f"{self.user}@{self.host}",
-        ])
+        cmd.append(f"{self.user}@{self.host}")
         return cmd
 
-    def _build_scp_cmd(self) -> List[str]:
-        cmd = ["scp"]
-        if self.key:
-            cmd.extend(["-i", self.key])
-        cmd.extend([
-            "-o", "StrictHostKeyChecking=no",
-            "-o", "UserKnownHostsFile=/dev/null",
-            "-P", str(self.port),
-        ])
-        return cmd
+    def _remote_shell_command(self, command: str) -> str:
+        """Wrap the requested command so it runs as root on the remote host."""
+        base = f"bash -lc {shlex.quote(command)}"
+        if self.user == "root":
+            return base
+        if self.sudo_password:
+            quoted_pw = shlex.quote(self.sudo_password)
+            return f"echo {quoted_pw} | sudo -S {base}"
+        return f"sudo -n {base}"
 
-    def upload_file(self, local_path: str, remote_path: str) -> bool:
-        """Upload a file to the remote host."""
-        cmd = self._build_scp_cmd() + [local_path, f"{self.user}@{self.host}:{remote_path}"]
-        try:
-            subprocess.run(cmd, check=True, capture_output=True, timeout=60)
-            return True
-        except subprocess.CalledProcessError as e:
-            console.print(f"[red]SCP failed: {e.stderr.decode()}[/red]")
-            return False
-        except Exception as e:
-            console.print(f"[red]SCP error: {e}[/red]")
-            return False
+    def run_command(self, command: str) -> RunCommandResult:
+        if not command:
+            return RunCommandResult(
+                command="",
+                stdout="",
+                stderr="No command provided",
+                exit_code=None,
+                success=False,
+                duration=0.0,
+                timed_out=False,
+            )
 
-    def execute_commands(self, commands: List[str]) -> Tuple[bool, str, List[Dict[str, Any]]]:
-        """
-        Execute commands by creating a script, uploading it, and running it.
-        
-        Returns:
-            Tuple of (all_successful, combined_output, detailed_results)
-        """
-        # Create a temporary script file locally
-        timestamp = int(time.time())
-        script_name = f"remediation_{timestamp}.sh"
-        remote_script_path = f"/tmp/{script_name}"
-        
-        # Generate script content
-        # We use set -x for verbose output (echoing commands)
-        # We use set -e to stop on error (optional, but good for strictness. 
-        # However, for this agent we might want to continue to see all errors? 
-        # Let's stick to sequential execution without set -e for now to match previous behavior 
-        # where we tried to run everything, but now we have state.)
-        # Actually, let's use a helper function in the script to run commands and capture status.
-        
-        script_content = ["#!/bin/bash", "export LANG=C"]
-        
-        # If we have a sudo password, we can use it.
-        # But we are running the *entire script* with sudo.
-        
-        for cmd in commands:
-            script_content.append(f"echo 'Running: {cmd}'")
-            script_content.append(cmd)
-            script_content.append("if [ $? -ne 0 ]; then echo 'COMMAND_FAILED'; fi")
-            script_content.append("echo '---'")
+        remote_command = self._remote_shell_command(command)
+        ssh_cmd = self._build_ssh_cmd() + [remote_command]
 
-        import tempfile
-        with tempfile.NamedTemporaryFile(mode='w', delete=False, suffix='.sh', newline='\n') as tmp:
-            tmp.write("\n".join(script_content))
-            tmp_path = tmp.name
+        start = time.time()
+        stdout = ""
+        stderr = ""
+        exit_code: Optional[int] = None
+        success = False
+        timed_out = False
 
         try:
-            # Upload script
-            if not self.upload_file(tmp_path, remote_script_path):
-                return False, "Failed to upload remediation script", []
-
-            # Execute script
-            # We wrap the execution in sudo if password is provided
-            if self.sudo_password:
-                # echo password | sudo -S bash script
-                # We need to be careful with quoting.
-                # The command to run on remote is: echo 'PASS' | sudo -S bash /tmp/script
-                remote_cmd = f"echo {shlex.quote(self.sudo_password)} | sudo -S bash {remote_script_path}"
-            else:
-                # Just bash script (assuming user is root or doesn't need sudo, which is unlikely for fixes)
-                # But if user is root, sudo -S might complain or just work.
-                # If no sudo password, maybe we just try running it?
-                remote_cmd = f"bash {remote_script_path}"
-
-            ssh_cmd = self._build_ssh_cmd() + [remote_cmd]
-            
-            result = subprocess.run(ssh_cmd, capture_output=True, text=True, timeout=600)
-            
-            # Cleanup remote script (best effort)
-            cleanup_cmd = self._build_ssh_cmd() + [f"rm -f {remote_script_path}"]
-            subprocess.run(cleanup_cmd, capture_output=True, timeout=10)
-
-            output = result.stdout + result.stderr
-            
-            # Parse output to reconstruct detailed results
-            # This is a bit loose because we are parsing stdout.
-            # But it's better than nothing.
-            detailed_results = []
-            
-            # Simple parsing logic could be improved, but for now let's just return the whole blob
-            # and mark success based on return code of the script.
-            # Since we didn't use set -e, the script return code might be 0 even if commands failed.
-            # We need to check for COMMAND_FAILED in output.
-            
-            success = (result.returncode == 0) and ("COMMAND_FAILED" not in output)
-            
-            # Create a single "detailed result" for the whole script for now, 
-            # or try to split it if we really want to match the old interface.
-            # The old interface expects a list of results.
-            
-            detailed_results.append({
-                'command': 'full_remediation_script',
-                'exit_code': result.returncode,
-                'stdout': result.stdout,
-                'stderr': result.stderr,
-                'success': success
-            })
-
-            return success, output, detailed_results
-
+            completed = subprocess.run(
+                ssh_cmd,
+                capture_output=True,
+                text=True,
+                timeout=self.command_timeout,
+            )
+            stdout = completed.stdout or ""
+            stderr = completed.stderr or ""
+            exit_code = completed.returncode
+            success = exit_code == 0
+        except subprocess.TimeoutExpired as exc:
+            stdout = exc.stdout or ""
+            stderr = (exc.stderr or "") + f"\nCommand timed out after {self.command_timeout} seconds."
+            timed_out = True
+        except FileNotFoundError as exc:
+            stderr = f"SSH binary not found: {exc}"
         finally:
-            if os.path.exists(tmp_path):
-                os.unlink(tmp_path)
+            duration = time.time() - start
+
+        stdout, stdout_truncated = self._truncate(stdout)
+        stderr, stderr_truncated = self._truncate(stderr)
+
+        return RunCommandResult(
+            command=command,
+            stdout=stdout,
+            stderr=stderr,
+            exit_code=exit_code,
+            success=success,
+            duration=duration,
+            timed_out=timed_out,
+            truncated_stdout=stdout_truncated,
+            truncated_stderr=stderr_truncated,
+        )
+
+
+class ToolCallingLLM:
+    """LLM wrapper that drives tool-calling remediation sessions."""
+
+    def __init__(
+        self,
+        model_name: str,
+        base_url: str,
+        api_key: str,
+        system_prompt: str,
+        shell_executor: ShellCommandExecutor,
+        command_normalizer: Optional[Callable[[str], str]] = None,
+        max_tool_iterations: int = 24,
+        request_timeout: int = 90,
+    ):
+        self.model_name = model_name
+        self.base_url = base_url.rstrip("/")
+        self.api_key = api_key
+        self.system_prompt = system_prompt
+        self.shell_executor = shell_executor
+        self.command_normalizer = command_normalizer or (lambda cmd: cmd)
+        self.max_tool_iterations = max_tool_iterations
+        self.request_timeout = request_timeout
+        self.endpoint = f"{self.base_url}/chat/completions"
+        self.headers = {
+            "Content-Type": "application/json",
+            "Authorization": f"Bearer {self.api_key}",
+        }
+        self.tools = [
+            {
+                "type": "function",
+                "function": {
+                    "name": "run_command",
+                    "description": (
+                        "Execute a single shell command as root on the Rocky Linux target. "
+                        "Never include sudo and do not chain multiple commands."
+                    ),
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "command": {
+                                "type": "string",
+                                "description": "Single shell command to execute. No && or multiple commands.",
+                            }
+                        },
+                        "required": ["command"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+            {
+                "type": "function",
+                "function": {
+                    "name": "verdict",
+                    "description": "Signal that remediation is complete along with a short summary.",
+                    "parameters": {
+                        "type": "object",
+                        "properties": {
+                            "message": {"type": "string"},
+                            "resolved": {"type": "boolean"},
+                        },
+                        "required": ["message", "resolved"],
+                        "additionalProperties": False,
+                    },
+                },
+            },
+        ]
+
+    def run_session(
+        self,
+        user_prompt: str,
+        session_label: str,
+    ) -> Dict[str, Any]:
+        messages: List[Dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+        transcript: List[Dict[str, Any]] = [
+            {"role": "system", "content": self.system_prompt},
+            {"role": "user", "content": user_prompt},
+        ]
+
+        executed_commands: List[str] = []
+        detailed_results: List[Dict[str, Any]] = []
+        combined_output_parts: List[str] = []
+        usage_records: List[Dict[str, Any]] = []
+        verdict: Optional[Dict[str, Any]] = None
+
+        command_calls = 0
+        reasoning_turns = 0
+
+        while command_calls < self.max_tool_iterations:
+            response = self._chat(messages)
+            usage = response.get("usage")
+            if usage:
+                usage_records.append(usage)
+
+            message = response["choices"][0]["message"]
+            assistant_entry: Dict[str, Any] = {
+                "role": "assistant",
+                "content": message.get("content"),
+            }
+            if message.get("tool_calls"):
+                assistant_entry["tool_calls"] = message["tool_calls"]
+            transcript.append(assistant_entry)
+            messages.append(message)
+
+            tool_calls = message.get("tool_calls") or []
+            if not tool_calls:
+                reasoning_turns += 1
+                if reasoning_turns > 6:
+                    break
+                continue
+
+            for tool_call in tool_calls:
+                name = tool_call["function"]["name"]
+                raw_args = tool_call["function"].get("arguments") or "{}"
+                try:
+                    args = json.loads(raw_args)
+                except Exception:
+                    args = {}
+
+                payload: Dict[str, Any]
+                if name == "run_command":
+                    command = (args.get("command") or "").strip()
+                    if not command:
+                        payload = {"error": "No command provided"}
+                    else:
+                        normalized = self.command_normalizer(command)
+                        run_result = self.shell_executor.run_command(normalized)
+                        payload = run_result.model_dump()
+                        if normalized != command:
+                            payload["normalized_from"] = command
+
+                        executed_commands.append(payload.get("command", command))
+                        detailed_entry = {
+                            "command": payload.get("command", command),
+                            "exit_code": payload.get("exit_code"),
+                            "stdout": payload.get("stdout", ""),
+                            "stderr": payload.get("stderr", ""),
+                            "success": payload.get("success", False),
+                            "timed_out": payload.get("timed_out", False),
+                            "duration": payload.get("duration"),
+                            "normalized_from": payload.get("normalized_from"),
+                        }
+                        detailed_results.append(detailed_entry)
+                        combined_output_parts.append(self._format_command_result(detailed_entry))
+
+                    command_calls += 1
+                    if command_calls >= self.max_tool_iterations:
+                        pass
+                elif name == "verdict":
+                    verdict = {
+                        "message": args.get("message", ""),
+                        "resolved": bool(args.get("resolved")),
+                    }
+                    payload = {"acknowledged": True}
+                else:
+                    payload = {"error": f"Unknown tool {name}"}
+
+                tool_entry = {
+                    "role": "tool",
+                    "tool_call_id": tool_call["id"],
+                    "content": json.dumps(payload),
+                }
+                transcript.append(tool_entry)
+                messages.append(tool_entry)
+
+                if name == "verdict" or command_calls >= self.max_tool_iterations:
+                    break
+
+            if verdict or command_calls >= self.max_tool_iterations:
+                break
+
+        apply_success = any(result.get("success") for result in detailed_results)
+
+        return {
+            "commands": executed_commands,
+            "detailed_results": detailed_results,
+            "combined_output": "\n\n".join(combined_output_parts),
+            "verdict": verdict,
+            "apply_success": apply_success,
+            "transcript": transcript,
+            "usage": usage_records,
+            "session_label": session_label,
+        }
+
+    def _chat(self, messages: List[Dict[str, Any]]) -> Dict[str, Any]:
+        payload = {
+            "model": self.model_name,
+            "messages": messages,
+            "tools": self.tools,
+            "tool_choice": "auto",
+        }
+        response = requests.post(
+            self.endpoint,
+            headers=self.headers,
+            json=payload,
+            timeout=self.request_timeout,
+        )
+        if response.status_code >= 400:
+            raise RuntimeError(f"LLM API error {response.status_code}: {response.text}")
+        return response.json()
+
+    def _format_command_result(self, detail: Dict[str, Any]) -> str:
+        stdout = detail.get("stdout") or ""
+        stderr = detail.get("stderr") or ""
+        return "\n".join([
+            f"$ {detail.get('command', '<unknown>')} (exit={detail.get('exit_code')})",
+            "STDOUT:",
+            stdout if stdout.strip() else "<empty>",
+            "STDERR:",
+            stderr if stderr.strip() else "<empty>",
+            "",
+        ])
 
 
 def main():
